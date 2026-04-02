@@ -6,6 +6,7 @@ import calendar as cal_module
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from datetime import datetime, date
+import re
 from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeout
 
 # aiohttp 설치 필요: pip install aiohttp --break-system-packages
@@ -130,7 +131,7 @@ async def check_availability() -> tuple[bool, int | None, str]:
     if HAS_AIOHTTP:
         return await _check_availability_async()
     else:
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         return await loop.run_in_executor(None, _check_availability_sync)
 
 
@@ -252,12 +253,11 @@ async def ensure_month_visible(page, year: int, month: int, max_clicks: int = 6)
                 logger.info(f"    ✅ {month}월 달력 확인됨")
                 return True
 
-            # 현재 달력 월 파싱하여 앞/뒤 방향 결정
+            # 현재 달력 월 파싱하여 앞/뒤 방향 결정 (regex로 정확히 추출)
             current_month = None
-            for m in range(1, 13):
-                if f"{m}월" in month_text:
-                    current_month = m
-                    break
+            m_match = re.search(r'(\d{1,2})월', month_text)
+            if m_match:
+                current_month = int(m_match.group(1))
 
             if current_month is not None and current_month > month:
                 # 현재 월이 목표보다 크면 이전 달로 이동
@@ -329,20 +329,22 @@ async def select_earliest_weekend(page, target_month: int) -> bool:
     
     for day in weekend_days:
         target_date = f"{TARGET_YEAR}-{target_month:02d}-{day:02d}"
-        
+        date_clicked = False  # 이 날짜를 이미 클릭했는지 추적
+
         # data-date 속성을 이용한 선택
         selectors = [
             f"button[data-date='{target_date}']:not(.is-disabled):not(.is-full)",
             f"button[data-date='{target_date}']:not([disabled])",
             f"td[data-date='{target_date}'] button:not(.is-disabled)",
         ]
-        
+
         for sel in selectors:
             try:
                 btn = page.locator(sel).first
                 if await btn.count() and await btn.is_visible():
                     await btn.click()
                     await asyncio.sleep(TIMING["click_delay"])
+                    date_clicked = True
 
                     # 시간 슬롯이 실제로 나타났는지 확인 후 return
                     try:
@@ -354,11 +356,14 @@ async def select_earliest_weekend(page, target_month: int) -> bool:
                         return True
                     except PlaywrightTimeout:
                         logger.warning(f"    ⚠️  {target_date} 클릭 후 시간 슬롯 미표시 → 다음 날짜 시도")
-                        continue  # 시간 슬롯이 없으면 다음 날짜로
+                        break  # 같은 날짜 중복 클릭 방지: inner loop 탈출
             except Exception as e:
                 logger.debug(f"    셀렉터 {sel} 실패: {type(e).__name__}")
                 continue
-        
+
+        if date_clicked:
+            continue  # 이미 클릭했으나 시간슬롯 없음 → 다음 날짜로
+
         # data-date 속성이 없는 경우 텍스트 기반 fallback
         try:
             calendar_btn = page.locator(
@@ -597,7 +602,16 @@ async def do_booking(target_month: int) -> bool:
             logger.info(f"\n  📱 예약 페이지 로드 중...")
             await page.goto(BOOKING_URL, wait_until="domcontentloaded")
             await asyncio.sleep(TIMING["page_load_wait"])
-            
+
+            # 로그인 세션 만료 감지
+            current_url = page.url
+            page_title = await page.title()
+            if "login" in current_url.lower() or "로그인" in page_title:
+                raise Exception(
+                    f"로그인 세션 만료 - 네이버 로그인 페이지로 리다이렉트됨 "
+                    f"(URL: {current_url}). save_login.py로 세션을 갱신하세요."
+                )
+
             success = await run_booking(page, target_month)
             
             if success:
