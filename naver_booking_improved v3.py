@@ -142,32 +142,46 @@ async def _check_availability_async() -> tuple[bool, int | None, str]:
                 f"https://m.booking.naver.com/booking/13/bizes/{BIZ_ID}"
                 f"/items/{ITEM_ID}?lang=ko&startDate={TARGET_YEAR}-{month:02d}-01&theme=place"
             )
-            
+
             try:
                 async with session.get(check_url, timeout=aiohttp.ClientTimeout(total=15)) as resp:
                     text = await resp.text()
-                    
-                    if "운영하지 않는" in text or "404" in text:
-                        logger.debug(f"[{month:02d}월] 페이지 오류")
+
+                    # 로그인 필요 페이지 감지
+                    if "로그인" in text and "예약하기" not in text:
+                        logger.warning(f"[{month:02d}월] ⚠️  실패 원인: 로그인 필요 (HTTP 체크는 세션 없이 동작 - 결과 신뢰 불가)")
                         continue
-                    
+
+                    if resp.status == 404 or "운영하지 않는" in text or "존재하지 않는" in text:
+                        logger.warning(f"[{month:02d}월] ⚠️  실패 원인: 페이지 오류 (HTTP {resp.status}, 업체/상품 ID 확인 필요)")
+                        continue
+
+                    if resp.status != 200:
+                        logger.warning(f"[{month:02d}월] ⚠️  실패 원인: HTTP {resp.status} 응답")
+                        continue
+
                     available_keywords = ["예약하기", "잔여", "예약 가능", "남은 자리"]
                     full_keywords = ["마감", "예약불가", "예약 불가", "품절", "모두 예약됨"]
-                    
+
                     has_available = any(k in text for k in available_keywords)
                     has_full = any(k in text for k in full_keywords)
-                    
+
                     if has_available and not has_full:
                         message = f"{TARGET_YEAR}년 {month}월 예약 가능한 자리 발견!"
                         return True, month, message
-                    
-                    logger.debug(f"[{month:02d}월] 예약불가")
-            
+
+                    if has_full:
+                        logger.info(f"[{month:02d}월] ℹ️  실패 원인: 자리 없음 (마감/예약불가 상태)")
+                    elif not has_available:
+                        logger.info(f"[{month:02d}월] ℹ️  실패 원인: 예약 버튼 미감지 (페이지 구조 변경 또는 비공개 상태)")
+                    else:
+                        logger.info(f"[{month:02d}월] ℹ️  실패 원인: 예약 가능 + 마감 키워드 동시 감지 (상태 불명확)")
+
             except asyncio.TimeoutError:
-                logger.warning(f"[{month:02d}월] 타임아웃")
+                logger.warning(f"[{month:02d}월] ⚠️  실패 원인: 네트워크 타임아웃 (15초 초과)")
             except Exception as e:
-                logger.warning(f"[{month:02d}월] 오류: {type(e).__name__}")
-        
+                logger.warning(f"[{month:02d}월] ⚠️  실패 원인: 예외 발생 ({type(e).__name__}: {e})")
+
         return False, None, "자리 없음"
 
 
@@ -178,32 +192,46 @@ def _check_availability_sync() -> tuple[bool, int | None, str]:
             f"https://m.booking.naver.com/booking/13/bizes/{BIZ_ID}"
             f"/items/{ITEM_ID}?lang=ko&startDate={TARGET_YEAR}-{month:02d}-01&theme=place"
         )
-        
+
         try:
             resp = requests.get(check_url, headers=HEADERS, timeout=15)
             text = resp.text
-            
-            if "운영하지 않는" in text or "404" in text:
-                logger.debug(f"[{month:02d}월] 페이지 오류")
+
+            # 로그인 필요 페이지 감지
+            if "로그인" in text and "예약하기" not in text:
+                logger.warning(f"[{month:02d}월] ⚠️  실패 원인: 로그인 필요 (HTTP 체크는 세션 없이 동작 - 결과 신뢰 불가)")
                 continue
-            
+
+            if resp.status_code == 404 or "운영하지 않는" in text or "존재하지 않는" in text:
+                logger.warning(f"[{month:02d}월] ⚠️  실패 원인: 페이지 오류 (HTTP {resp.status_code}, 업체/상품 ID 확인 필요)")
+                continue
+
+            if resp.status_code != 200:
+                logger.warning(f"[{month:02d}월] ⚠️  실패 원인: HTTP {resp.status_code} 응답")
+                continue
+
             available_keywords = ["예약하기", "잔여", "예약 가능", "남은 자리"]
             full_keywords = ["마감", "예약불가", "예약 불가", "품절", "모두 예약됨"]
-            
+
             has_available = any(k in text for k in available_keywords)
             has_full = any(k in text for k in full_keywords)
-            
+
             if has_available and not has_full:
                 message = f"{TARGET_YEAR}년 {month}월 예약 가능한 자리 발견!"
                 return True, month, message
-            
-            logger.debug(f"[{month:02d}월] 예약불가")
-        
+
+            if has_full:
+                logger.info(f"[{month:02d}월] ℹ️  실패 원인: 자리 없음 (마감/예약불가 상태)")
+            elif not has_available:
+                logger.info(f"[{month:02d}월] ℹ️  실패 원인: 예약 버튼 미감지 (페이지 구조 변경 또는 비공개 상태)")
+            else:
+                logger.info(f"[{month:02d}월] ℹ️  실패 원인: 예약 가능 + 마감 키워드 동시 감지 (상태 불명확)")
+
         except requests.Timeout:
-            logger.warning(f"[{month:02d}월] 타임아웃")
+            logger.warning(f"[{month:02d}월] ⚠️  실패 원인: 네트워크 타임아웃 (15초 초과)")
         except Exception as e:
-            logger.warning(f"[{month:02d}월] 오류: {type(e).__name__}")
-    
+            logger.warning(f"[{month:02d}월] ⚠️  실패 원인: 예외 발생 ({type(e).__name__}: {e})")
+
     return False, None, "자리 없음"
 
 
@@ -212,35 +240,64 @@ def _check_availability_sync() -> tuple[bool, int | None, str]:
 # ====================================================
 async def ensure_month_visible(page, year: int, month: int, max_clicks: int = 6) -> bool:
     """
-    달력을 특정 월로 이동
+    달력을 특정 월로 이동 (앞/뒤 양방향)
     """
     for attempt in range(max_clicks):
         try:
             month_text = await page.locator(
                 "[class*='calendar_header'], [class*='month_title'], [class*='calendar_month']"
             ).first.inner_text(timeout=3000)
-            
+
             if f"{month}월" in month_text or f"{month:02d}월" in month_text:
                 logger.info(f"    ✅ {month}월 달력 확인됨")
                 return True
-            
-            next_btn = (
-                page.locator("button[aria-label*='다음']")
-                .or_(page.locator("button.btn_next"))
-                .or_(page.locator("button:has-text('다음')"))
-                .first
-            )
-            if await next_btn.count():
-                await next_btn.click()
-                await asyncio.sleep(TIMING["month_navigation_delay"])
+
+            # 현재 달력 월 파싱하여 앞/뒤 방향 결정
+            current_month = None
+            for m in range(1, 13):
+                if f"{m}월" in month_text:
+                    current_month = m
+                    break
+
+            if current_month is not None and current_month > month:
+                # 현재 월이 목표보다 크면 이전 달로 이동
+                prev_btn = (
+                    page.locator("button[aria-label*='이전']")
+                    .or_(page.locator("button.btn_prev"))
+                    .or_(page.locator("button:has-text('이전')"))
+                    .first
+                )
+                if await prev_btn.count():
+                    await prev_btn.click()
+                    await asyncio.sleep(TIMING["month_navigation_delay"])
+                    continue
+                else:
+                    logger.warning(f"    ⚠️  실패 원인: 이전 달 버튼을 찾을 수 없음 (현재 {current_month}월 → 목표 {month}월)")
+                    return False
+            else:
+                # 다음 달로 이동
+                next_btn = (
+                    page.locator("button[aria-label*='다음']")
+                    .or_(page.locator("button.btn_next"))
+                    .or_(page.locator("button:has-text('다음')"))
+                    .first
+                )
+                if await next_btn.count():
+                    await next_btn.click()
+                    await asyncio.sleep(TIMING["month_navigation_delay"])
+                else:
+                    logger.warning(f"    ⚠️  실패 원인: 다음 달 버튼을 찾을 수 없음")
+                    return False
+
         except PlaywrightTimeout:
             if attempt == max_clicks - 1:
-                logger.warning(f"    ⚠️  월 이동 실패: 타임아웃")
+                logger.warning(f"    ⚠️  실패 원인: 달력 헤더 로드 타임아웃 ({max_clicks}회 시도 초과)")
         except Exception as e:
             if attempt == max_clicks - 1:
-                logger.warning(f"    ⚠️  월 이동 실패: {type(e).__name__}: {e}")
+                logger.warning(f"    ⚠️  실패 원인: 달력 이동 중 예외 ({type(e).__name__}: {e})")
             continue
-    
+
+    logger.warning(f"    ⚠️  실패 원인: {max_clicks}회 시도 후에도 {month}월 달력 이동 실패")
     return False
 
 
@@ -286,17 +343,18 @@ async def select_earliest_weekend(page, target_month: int) -> bool:
                 if await btn.count() and await btn.is_visible():
                     await btn.click()
                     await asyncio.sleep(TIMING["click_delay"])
-                    
+
+                    # 시간 슬롯이 실제로 나타났는지 확인 후 return
                     try:
                         await page.wait_for_selector(
                             "button.time_slot, button[class*='time']:not([disabled]), li.time_item button",
                             timeout=TIMING["selector_timeout"]
                         )
+                        logger.info(f"    ✅ {target_date} 선택됨 (시간 슬롯 확인)")
+                        return True
                     except PlaywrightTimeout:
-                        await asyncio.sleep(1)
-                    
-                    logger.info(f"    ✅ {target_date} 선택됨")
-                    return True
+                        logger.warning(f"    ⚠️  {target_date} 클릭 후 시간 슬롯 미표시 → 다음 날짜 시도")
+                        continue  # 시간 슬롯이 없으면 다음 날짜로
             except Exception as e:
                 logger.debug(f"    셀렉터 {sel} 실패: {type(e).__name__}")
                 continue
@@ -309,12 +367,20 @@ async def select_earliest_weekend(page, target_month: int) -> bool:
             if await calendar_btn.count() and await calendar_btn.is_visible():
                 await calendar_btn.click()
                 await asyncio.sleep(TIMING["click_delay"])
-                logger.info(f"    ✅ {target_date} 선택됨 (텍스트 fallback)")
-                return True
+
+                try:
+                    await page.wait_for_selector(
+                        "button.time_slot, button[class*='time']:not([disabled]), li.time_item button",
+                        timeout=TIMING["selector_timeout"]
+                    )
+                    logger.info(f"    ✅ {target_date} 선택됨 (텍스트 fallback, 시간 슬롯 확인)")
+                    return True
+                except PlaywrightTimeout:
+                    logger.warning(f"    ⚠️  {target_date} 텍스트 fallback 클릭 후 시간 슬롯 미표시 → 다음 날짜 시도")
         except Exception as e:
             logger.debug(f"    텍스트 fallback 실패: {type(e).__name__}")
     
-    logger.warning(f"    ⚠️  {target_month}월 가능한 주말 날짜 없음")
+    logger.warning(f"    ⚠️  실패 원인: {target_month}월 주말 날짜 중 예약 가능하고 시간 슬롯이 있는 날짜 없음")
     return False
 
 
@@ -345,7 +411,7 @@ async def select_earliest_time(page) -> bool:
             logger.debug(f"    시간 셀렉터 {sel} 실패: {type(e).__name__}")
             continue
     
-    logger.warning("    ⚠️  가능한 시간 슬롯 없음")
+    logger.warning("    ⚠️  실패 원인: 가능한 시간 슬롯 없음 (모두 마감 또는 셀렉터 불일치)")
     return False
 
 
@@ -410,14 +476,16 @@ async def fill_person_info(page, p1: dict, p2: dict):
         logger.info(f"    ✅ 배우자 생년월일: {p2['birthday']}")
     else:
         spouse_birth_loc = page.locator(
-            "input[name*='spouse'], input[name*='partner'], "
-            "input[name*='companion'], input[name*='guest'], "
-            "input[placeholder*='배우자']"
+            "input[name*='spouse_birth'], input[name*='partner_birth'], "
+            "input[name*='companion_birth'], input[name*='guest_birth'], "
+            "input[placeholder*='배우자 생년월일'], input[placeholder*='동반자 생년월일']"
         )
         if await spouse_birth_loc.count():
             await spouse_birth_loc.first.fill(p2["birthday"])
             await asyncio.sleep(TIMING["form_fill_delay"])
             logger.info(f"    ✅ 배우자 생년월일 (별도 필드): {p2['birthday']}")
+        else:
+            logger.warning(f"    ⚠️  실패 원인: 배우자 생년월일 입력 필드를 찾을 수 없음 (폼 구조 확인 필요)")
 
 
 # ====================================================
@@ -509,7 +577,7 @@ async def do_booking(target_month: int) -> bool:
     저장된 로그인 세션을 사용하여 예약 수행
     """
     async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=False, slow_mo=100)
+        browser = await p.chromium.launch(headless=True, slow_mo=100)
         
         try:
             context = await browser.new_context(
@@ -636,7 +704,6 @@ async def main():
                 success = await do_booking(target_month)
                 if success:
                     booking_done = True
-                    alerted_months.discard(target_month)
                 else:
                     logger.warning(f"  예약 미확인 - {CHECK_INTERVAL}초 후 재시도")
             except Exception as e:
