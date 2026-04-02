@@ -9,13 +9,6 @@ from datetime import datetime, date
 import re
 from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeout
 
-# aiohttp 설치 필요: pip install aiohttp --break-system-packages
-try:
-    import aiohttp
-    HAS_AIOHTTP = True
-except ImportError:
-    import requests
-    HAS_AIOHTTP = False
 
 
 # ====================================================
@@ -85,11 +78,6 @@ MOBILE_USER_AGENT = (
     "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1"
 )
 
-HEADERS = {
-    "User-Agent": MOBILE_USER_AGENT,
-    "Accept-Language": "ko-KR,ko;q=0.9",
-}
-
 
 # ====================================================
 #  이메일 발송
@@ -121,44 +109,51 @@ def send_email(subject: str, body: str) -> bool:
 
 
 # ====================================================
-#  자리 감지 (비동기)
+#  자리 감지 - Playwright (JS 렌더링 후 정확한 상태 확인)
 # ====================================================
 async def check_availability() -> tuple[bool, int | None, str]:
     """
-    각 월별로 예약 페이지를 확인하여 예약 가능 상태 감지.
-    aiohttp 사용 권장 (없으면 requests fallback)
+    Playwright로 JS 렌더링 후 예약 가능 여부 확인.
+    로그인 세션을 사용하므로 실제 예약 화면 기준으로 판단.
     """
-    if HAS_AIOHTTP:
-        return await _check_availability_async()
-    else:
-        loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(None, _check_availability_sync)
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=True)
 
-
-async def _check_availability_async() -> tuple[bool, int | None, str]:
-    """aiohttp를 사용한 비동기 HTTP 체크"""
-    async with aiohttp.ClientSession(headers=HEADERS) as session:
-        for month in TARGET_MONTHS:
-            check_url = (
-                f"https://m.booking.naver.com/booking/13/bizes/{BIZ_ID}"
-                f"/items/{ITEM_ID}?lang=ko&startDate={TARGET_YEAR}-{month:02d}-01&theme=place"
+        try:
+            context = await browser.new_context(
+                storage_state=LOGIN_STATE_FILE,
+                viewport={"width": 390, "height": 844},
+                user_agent=MOBILE_USER_AGENT,
             )
+        except FileNotFoundError:
+            logger.error(f"❌ 로그인 세션 파일 '{LOGIN_STATE_FILE}' 없음! save_login.py로 먼저 세션을 저장하세요.")
+            await browser.close()
+            raise Exception(f"로그인 세션 파일 '{LOGIN_STATE_FILE}' 없음")
 
-            try:
-                async with session.get(check_url, timeout=aiohttp.ClientTimeout(total=15)) as resp:
-                    text = await resp.text()
+        page = await context.new_page()
 
-                    # 로그인 필요 페이지 감지
-                    if "로그인" in text and "예약하기" not in text:
-                        logger.warning(f"[{month:02d}월] ⚠️  실패 원인: 로그인 필요 (HTTP 체크는 세션 없이 동작 - 결과 신뢰 불가)")
-                        continue
+        try:
+            for month in TARGET_MONTHS:
+                check_url = (
+                    f"https://m.booking.naver.com/booking/13/bizes/{BIZ_ID}"
+                    f"/items/{ITEM_ID}?lang=ko&startDate={TARGET_YEAR}-{month:02d}-01&theme=place"
+                )
 
-                    if resp.status == 404 or "운영하지 않는" in text or "존재하지 않는" in text:
-                        logger.warning(f"[{month:02d}월] ⚠️  실패 원인: 페이지 오류 (HTTP {resp.status}, 업체/상품 ID 확인 필요)")
-                        continue
+                try:
+                    await page.goto(check_url, wait_until="networkidle", timeout=20000)
 
-                    if resp.status != 200:
-                        logger.warning(f"[{month:02d}월] ⚠️  실패 원인: HTTP {resp.status} 응답")
+                    # 로그인 세션 만료 감지
+                    current_url = page.url
+                    if "login" in current_url.lower() or "로그인" in await page.title():
+                        raise Exception(
+                            f"로그인 세션 만료 (리다이렉트: {current_url}). "
+                            f"save_login.py로 세션을 갱신하세요."
+                        )
+
+                    text = await page.content()  # JS 렌더링 완료 후 HTML
+
+                    if "운영하지 않는" in text or "존재하지 않는" in text:
+                        logger.warning(f"[{month:02d}월] ⚠️  실패 원인: 페이지 오류 (업체/상품 ID 확인 필요)")
                         continue
 
                     available_keywords = ["예약하기", "잔여", "예약 가능", "남은 자리"]
@@ -174,66 +169,21 @@ async def _check_availability_async() -> tuple[bool, int | None, str]:
                     if has_full:
                         logger.info(f"[{month:02d}월] ℹ️  실패 원인: 자리 없음 (마감/예약불가 상태)")
                     elif not has_available:
-                        logger.info(f"[{month:02d}월] ℹ️  실패 원인: 예약 버튼 미감지 (페이지 구조 변경 또는 비공개 상태)")
+                        logger.info(f"[{month:02d}월] ℹ️  실패 원인: 예약 버튼 미감지 (달력 미오픈 또는 전체 마감)")
                     else:
                         logger.info(f"[{month:02d}월] ℹ️  실패 원인: 예약 가능 + 마감 키워드 동시 감지 (상태 불명확)")
 
-            except asyncio.TimeoutError:
-                logger.warning(f"[{month:02d}월] ⚠️  실패 원인: 네트워크 타임아웃 (15초 초과)")
-            except Exception as e:
-                logger.warning(f"[{month:02d}월] ⚠️  실패 원인: 예외 발생 ({type(e).__name__}: {e})")
+                except PlaywrightTimeout:
+                    logger.warning(f"[{month:02d}월] ⚠️  실패 원인: 페이지 로드 타임아웃 (20초 초과)")
+                except Exception as e:
+                    if "로그인 세션 만료" in str(e):
+                        raise
+                    logger.warning(f"[{month:02d}월] ⚠️  실패 원인: 예외 발생 ({type(e).__name__}: {e})")
 
-        return False, None, "자리 없음"
+            return False, None, "자리 없음"
 
-
-def _check_availability_sync() -> tuple[bool, int | None, str]:
-    """requests를 사용한 동기 HTTP 체크 (fallback)"""
-    for month in TARGET_MONTHS:
-        check_url = (
-            f"https://m.booking.naver.com/booking/13/bizes/{BIZ_ID}"
-            f"/items/{ITEM_ID}?lang=ko&startDate={TARGET_YEAR}-{month:02d}-01&theme=place"
-        )
-
-        try:
-            resp = requests.get(check_url, headers=HEADERS, timeout=15)
-            text = resp.text
-
-            # 로그인 필요 페이지 감지
-            if "로그인" in text and "예약하기" not in text:
-                logger.warning(f"[{month:02d}월] ⚠️  실패 원인: 로그인 필요 (HTTP 체크는 세션 없이 동작 - 결과 신뢰 불가)")
-                continue
-
-            if resp.status_code == 404 or "운영하지 않는" in text or "존재하지 않는" in text:
-                logger.warning(f"[{month:02d}월] ⚠️  실패 원인: 페이지 오류 (HTTP {resp.status_code}, 업체/상품 ID 확인 필요)")
-                continue
-
-            if resp.status_code != 200:
-                logger.warning(f"[{month:02d}월] ⚠️  실패 원인: HTTP {resp.status_code} 응답")
-                continue
-
-            available_keywords = ["예약하기", "잔여", "예약 가능", "남은 자리"]
-            full_keywords = ["마감", "예약불가", "예약 불가", "품절", "모두 예약됨"]
-
-            has_available = any(k in text for k in available_keywords)
-            has_full = any(k in text for k in full_keywords)
-
-            if has_available and not has_full:
-                message = f"{TARGET_YEAR}년 {month}월 예약 가능한 자리 발견!"
-                return True, month, message
-
-            if has_full:
-                logger.info(f"[{month:02d}월] ℹ️  실패 원인: 자리 없음 (마감/예약불가 상태)")
-            elif not has_available:
-                logger.info(f"[{month:02d}월] ℹ️  실패 원인: 예약 버튼 미감지 (페이지 구조 변경 또는 비공개 상태)")
-            else:
-                logger.info(f"[{month:02d}월] ℹ️  실패 원인: 예약 가능 + 마감 키워드 동시 감지 (상태 불명확)")
-
-        except requests.Timeout:
-            logger.warning(f"[{month:02d}월] ⚠️  실패 원인: 네트워크 타임아웃 (15초 초과)")
-        except Exception as e:
-            logger.warning(f"[{month:02d}월] ⚠️  실패 원인: 예외 발생 ({type(e).__name__}: {e})")
-
-    return False, None, "자리 없음"
+        finally:
+            await browser.close()
 
 
 # ====================================================
@@ -674,13 +624,7 @@ async def main():
     logger.info(f" 📝 예약자1 (본인)  : {PERSON1['name']} ({PERSON1['birthday']})")
     logger.info(f" 👨‍👩‍👧 예약자2 (배우자): {PERSON2['name']} ({PERSON2['birthday']})")
     logger.info(f" 📂 로그인 세션: {LOGIN_STATE_FILE}")
-    
-    if HAS_AIOHTTP:
-        logger.info(f" 🌐 HTTP 클라이언트: aiohttp (비동기)")
-    else:
-        logger.info(f" 🌐 HTTP 클라이언트: requests (동기 fallback)")
-        logger.info(f" 💡  aiohttp 설치 권장: pip install aiohttp --break-system-packages")
-    
+    logger.info(f" 🌐 가용성 체크: Playwright (JS 렌더링, 로그인 세션 사용)")
     logger.info("=" * 70)
     logger.info("")
     
