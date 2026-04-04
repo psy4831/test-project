@@ -25,13 +25,26 @@ def create_logger(log_path="crawler_log.txt"):
 
 async def get_search_frame(page, log):
     """네이버 지도 검색 결과 iframe 반환"""
-    # iframe이 나타날 때까지 대기
-    try:
-        await page.wait_for_selector("#searchIframe", timeout=15000)
-    except PlaywrightTimeoutError:
-        log("오류: #searchIframe을 찾을 수 없습니다.")
+    # iframe이 나타날 때까지 대기 (여러 셀렉터 시도)
+    iframe_found = False
+    for sel in ["#searchIframe", "iframe[name='searchIframe']", "iframe[src*='search']"]:
+        try:
+            await page.wait_for_selector(sel, timeout=10000)
+            log(f"iframe 발견: {sel}")
+            iframe_found = True
+            break
+        except PlaywrightTimeoutError:
+            continue
+
+    if not iframe_found:
+        log("오류: searchIframe을 찾을 수 없습니다.")
         await page.screenshot(path="debug_screenshot.png", full_page=True)
         log("debug_screenshot.png 저장 완료 - 화면 상태를 확인하세요.")
+        # 현재 페이지의 모든 iframe 목록 출력
+        frames = page.frames
+        log(f"현재 페이지 iframe 목록 ({len(frames)}개):")
+        for f in frames:
+            log(f"  - name={f.name}, url={f.url[:80]}")
         return None
 
     # frame 이름으로 시도
@@ -162,7 +175,7 @@ async def extract_hospitals(frame, item_sel, log):
     return hospitals
 
 
-async def crawl_hospitals(search_query="강남구 피부과", max_pages=5, headless=True):
+async def crawl_hospitals(search_query="강남구 피부과", max_pages=5, headless=False):
     log, close_log = create_logger()
     all_hospitals = []
 
@@ -173,19 +186,31 @@ async def crawl_hospitals(search_query="강남구 피부과", max_pages=5, headl
         log("=" * 50)
 
         async with async_playwright() as p:
-            browser = await p.chromium.launch(headless=headless)
+            browser = await p.chromium.launch(
+                headless=headless,
+                args=["--disable-blink-features=AutomationControlled"]
+            )
             context = await browser.new_context(
                 user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                            "AppleWebKit/537.36 (KHTML, like Gecko) "
-                           "Chrome/120.0.0.0 Safari/537.36"
+                           "Chrome/120.0.0.0 Safari/537.36",
+                viewport={"width": 1280, "height": 800},
             )
             page = await context.new_page()
+
+            # 자동화 감지 우회
+            await page.add_init_script(
+                "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
+            )
 
             url = f"https://map.naver.com/p/search/{search_query}"
             log(f"접속 URL: {url}")
 
-            await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+            await page.goto(url, wait_until="networkidle", timeout=30000)
             log("페이지 로딩 완료")
+
+            # 충분히 대기
+            await page.wait_for_timeout(3000)
 
             # iframe 가져오기
             frame = await get_search_frame(page, log)
