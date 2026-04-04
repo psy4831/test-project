@@ -3,130 +3,183 @@
 JavaScript 렌더링이 완료될 때까지 기다림
 """
 import asyncio
+import csv
 import sys
 import traceback
 from datetime import datetime
-from playwright.async_api import async_playwright
+from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
 
-# 로그 파일 설정
-log_file = open("crawler_log.txt", "w", encoding="utf-8")
 
-def log(message):
-    """터미널과 파일 둘 다 출력"""
-    print(message)
-    log_file.write(message + "\n")
-    log_file.flush()
+def create_logger(log_path="crawler_log.txt"):
+    """파일+터미널 동시 출력 로거 반환"""
+    log_file = open(log_path, "w", encoding="utf-8")
 
-async def debug_naver_place():
-    """네이버 플레이스 구조 확인"""
+    def log(message):
+        print(message)
+        log_file.write(message + "\n")
+        log_file.flush()
+
+    def close():
+        log_file.close()
+
+    return log, close
+
+
+async def extract_hospital_data(frame):
+    """검색 결과 iframe에서 병원 데이터 추출"""
+    hospitals = []
+
+    # 결과 목록 로드 대기
+    try:
+        await frame.wait_for_selector("li.UEzoS", timeout=10000)
+    except PlaywrightTimeoutError:
+        # 셀렉터가 변경됐을 수 있으므로 대체 셀렉터 시도
+        try:
+            await frame.wait_for_selector("ul.rLcul li", timeout=5000)
+        except PlaywrightTimeoutError:
+            return hospitals
+
+    items = await frame.query_selector_all("li.UEzoS")
+    if not items:
+        items = await frame.query_selector_all("ul.rLcul li")
+
+    for item in items:
+        try:
+            name_el = await item.query_selector("span.TYaxT")
+            name = (await name_el.inner_text()).strip() if name_el else ""
+
+            category_el = await item.query_selector("span.KCMnt")
+            category = (await category_el.inner_text()).strip() if category_el else ""
+
+            address_el = await item.query_selector("span.LDgIH")
+            address = (await address_el.inner_text()).strip() if address_el else ""
+
+            rating_el = await item.query_selector("span.h69bs")
+            rating = (await rating_el.inner_text()).strip() if rating_el else ""
+
+            review_el = await item.query_selector("span.MVx6e")
+            review_count = (await review_el.inner_text()).strip() if review_el else ""
+
+            if name:
+                hospitals.append({
+                    "이름": name,
+                    "카테고리": category,
+                    "주소": address,
+                    "평점": rating,
+                    "리뷰수": review_count,
+                })
+        except Exception:
+            continue
+
+    return hospitals
+
+
+async def crawl_hospitals(search_query="강남구 피부과", max_pages=5, headless=True):
+    """네이버 지도에서 병원 데이터 크롤링"""
+    log, close_log = create_logger()
+
+    all_hospitals = []
+
     try:
         log("=" * 50)
-        log("크롤러 시작 (동적 로딩 대응 버전)")
+        log(f"크롤러 시작: {search_query}")
+        log(f"시작 시각: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
         log("=" * 50)
-        
+
         async with async_playwright() as p:
-            log("Playwright 초기화 중...")
-            browser = await p.chromium.launch(headless=False)
-            log("✅ 브라우저 실행 성공")
-            
-            page = await browser.new_page()
-            log("✅ 새 페이지 생성 성공")
-            
-            # 네이버 플레이스 검색 (PC 버전 시도)
-            search_query = "강남구 피부과"
-            
-            # 모바일 버전 대신 PC 버전 시도
-            url = f"https://map.naver.com/p/search/{search_query}"
-            
-            log(f"\n검색 URL: {url}")
-            log("페이지 로딩 중... (네트워크가 안정될 때까지 기다림)")
-            
-            # networkidle 옵션: 네트워크 요청이 거의 없을 때까지 기다림
-            await page.goto(url, wait_until="networkidle")
-            log("✅ 페이지 로딩 완료 (networkidle)")
-            
-            # 추가 대기
-            await page.wait_for_timeout(5000)
-            log("✅ 5초 추가 대기 완료")
-            
-            # 스크린샷 저장
-            await page.screenshot(path="debug_screenshot_v2.png", full_page=True)
-            log("✅ 스크린샷 저장: debug_screenshot_v2.png")
-            
-            # HTML 저장
-            html = await page.content()
-            with open("debug_page_v2.html", "w", encoding="utf-8") as f:
-                f.write(html)
-            log("✅ HTML 저장: debug_page_v2.html")
-            
-            # URL 확인
-            current_url = page.url
-            log(f"\n현재 URL: {current_url}")
-            
-            # 페이지 제목
-            title = await page.title()
-            log(f"페이지 제목: {title}")
-            
-            # PC 버전용 셀렉터 테스트
-            log("\n=== 셀렉터 테스트 (PC 버전) ===")
-            
-            selectors_to_test = [
-                # PC 버전 네이버 지도 셀렉터
-                "li.UEzoS",  # 검색 결과 아이템
-                "span.TYaxT",  # 업체명
-                "a.tzwk0",  # 링크
-                "div.zD5Nm",  # 평점
-                "ul.rLcul",  # 검색 결과 리스트
-                # 일반 셀렉터
-                "li",
-                "a",
-                "span",
-                "div[class*='search']",
-                "div[class*='place']",
-            ]
-            
-            for selector in selectors_to_test:
-                try:
-                    elements = await page.query_selector_all(selector)
-                    log(f"{selector}: {len(elements)}개 발견")
-                    
-                    if 0 < len(elements) < 30:
-                        # 처음 몇 개 요소의 텍스트 출력
-                        for i, elem in enumerate(elements[:5]):
-                            try:
-                                text = await elem.inner_text()
-                                cleaned = text.replace("\n", " ").strip()[:100]
-                                if cleaned:
-                                    log(f"  [{i}] {cleaned}")
-                            except:
-                                pass
-                            
-                except Exception as e:
-                    log(f"{selector}: 에러 - {str(e)}")
-            
-            log("\n브라우저 창을 직접 확인하세요.")
-            log("검색 결과가 보이나요?")
-            log("\n엔터키를 누르면 종료됩니다...")
-            
-            await browser.close()
-            log("✅ 브라우저 종료")
-            
-    except Exception as e:
-        log("\n" + "=" * 50)
-        log("🚨 에러 발생!")
-        log("=" * 50)
-        log(f"에러 타입: {type(e).__name__}")
-        log(f"에러 메시지: {str(e)}")
-        log("\n전체 스택 트레이스:")
-        log(traceback.format_exc())
+            browser = await p.chromium.launch(headless=headless)
+            log("브라우저 실행 완료")
 
-if __name__ == "__main__":
-    try:
-        asyncio.run(debug_naver_place())
+            page = await browser.new_page()
+
+            url = f"https://map.naver.com/p/search/{search_query}"
+            log(f"\n검색 URL: {url}")
+
+            await page.goto(url, wait_until="domcontentloaded")
+            log("페이지 로딩 완료")
+
+            # searchIframe 대기 (네이버 지도는 결과를 iframe에 렌더링)
+            try:
+                await page.wait_for_selector("#searchIframe", timeout=15000)
+                log("searchIframe 발견")
+            except PlaywrightTimeoutError:
+                log("searchIframe을 찾을 수 없습니다. 스크린샷을 확인하세요.")
+                await page.screenshot(path="debug_screenshot_v2.png", full_page=True)
+                html = await page.content()
+                with open("debug_page_v2.html", "w", encoding="utf-8") as f:
+                    f.write(html)
+                return []
+
+            for page_num in range(1, max_pages + 1):
+                log(f"\n--- 페이지 {page_num} 수집 중 ---")
+
+                # iframe 프레임 객체 가져오기
+                frame = page.frame(name="searchIframe")
+                if frame is None:
+                    frame_element = await page.query_selector("#searchIframe")
+                    if frame_element is None:
+                        log("iframe을 찾을 수 없습니다.")
+                        break
+                    frame = await frame_element.content_frame()
+
+                if frame is None:
+                    log("iframe 컨텍스트를 가져올 수 없습니다.")
+                    break
+
+                hospitals = await extract_hospital_data(frame)
+                log(f"  {len(hospitals)}개 항목 수집")
+                all_hospitals.extend(hospitals)
+
+                # 다음 페이지 버튼 클릭
+                if page_num < max_pages:
+                    try:
+                        next_btn = await frame.query_selector("a.eUTV2[aria-label='다음 페이지']")
+                        if next_btn is None:
+                            # 대체 셀렉터
+                            next_btn = await frame.query_selector("button.eUTV2:last-child")
+                        if next_btn is None:
+                            log("다음 페이지 버튼 없음. 마지막 페이지입니다.")
+                            break
+                        await next_btn.click()
+                        await frame.wait_for_load_state("networkidle")
+                        await page.wait_for_timeout(1500)
+                    except PlaywrightTimeoutError:
+                        log("다음 페이지 로딩 타임아웃")
+                        break
+                    except Exception as e:
+                        log(f"다음 페이지 이동 실패: {e}")
+                        break
+
+            await browser.close()
+            log("\n브라우저 종료")
+
     except Exception as e:
-        log(f"\n최상위 에러: {str(e)}")
+        log(f"\n오류 발생: {type(e).__name__}: {e}")
         log(traceback.format_exc())
     finally:
-        log_file.close()
-        print("\n\n모든 로그가 crawler_log.txt에 저장되었습니다.")
-        input("엔터키를 눌러 종료...")
+        log(f"\n총 {len(all_hospitals)}개 병원 데이터 수집 완료")
+        close_log()
+
+    return all_hospitals
+
+
+def save_to_csv(hospitals, filename="hospitals.csv"):
+    """병원 데이터를 CSV로 저장"""
+    if not hospitals:
+        print("저장할 데이터가 없습니다.")
+        return
+
+    fieldnames = ["이름", "카테고리", "주소", "평점", "리뷰수"]
+    with open(filename, "w", newline="", encoding="utf-8-sig") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(hospitals)
+
+    print(f"CSV 저장 완료: {filename} ({len(hospitals)}개)")
+
+
+if __name__ == "__main__":
+    search_query = sys.argv[1] if len(sys.argv) > 1 else "강남구 피부과"
+    hospitals = asyncio.run(crawl_hospitals(search_query=search_query, max_pages=5))
+    save_to_csv(hospitals)
+    print("\n모든 로그가 crawler_log.txt에 저장되었습니다.")
